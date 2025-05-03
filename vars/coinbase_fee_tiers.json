@@ -1,0 +1,12 @@
+{
+  "Intro 1": { "taker": 0.012, "maker": 0.006 },
+  "Intro 2": { "taker": 0.0075, "maker": 0.0035 },
+  "Advanced 1": { "taker": 0.004, "maker": 0.0025 },
+  "Advanced 2": { "taker": 0.0025, "maker": 0.0015 },
+  "Advanced 3": { "taker": 0.002, "maker": 0.001 },
+  "Advanced 4": { "taker": 0.0016, "maker": 0.0007 },
+  "Advanced 5": { "taker": 0.0014, "maker": 0.0005 },
+  "Advanced 6": { "taker": 0.001, "maker": 0.0002 },
+  "Advanced 7": { "taker": 0.0008, "maker": 0.0 },
+  "Advanced 8": { "taker": 0.0005, "maker": 0.0 }
+}
