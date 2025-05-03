@@ -2,6 +2,7 @@
 # FeeLiquidator
 
 FeeLiquidator is a Python-based GUI tool that rapidly executes small trades in a loop to quantify real-world slippage and fees on Coinbase. It supports both market and post-only limit orders.
+This drives up your market liquidity quickly by swapping BTC-USD at either market or tight limit orders with the goal of reaching lower fee tiers.
 
 ## ✅ Features
 
