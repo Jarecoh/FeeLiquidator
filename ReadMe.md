@@ -86,5 +86,3 @@ This script **places live orders** on your Coinbase account. Use small amounts a
 ## 📄 License
 
 MIT – Use at your own risk.
-
-```
