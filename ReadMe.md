@@ -46,7 +46,9 @@ With the following contents:
 }
 ```
 
-> ⚠️ Your API key must have **"trade"** permissions enabled in the **Coinbase Advanced Trade API**.
+> ⚠️ Your API key must have **"trade"** permissions enabled in the **Coinbase Advanced Trade API**.  
+> 🔑 You can create a new Coinbase Advanced API Key here:  
+> 👉 [coinbase.com/settings/api](https://www.coinbase.com/settings/api)
 
 ---
 
