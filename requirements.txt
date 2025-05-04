@@ -1,0 +1,2 @@
+coinbase-advanced-trade==1.3.0
+requests>=2.25.0
