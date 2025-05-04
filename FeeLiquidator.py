@@ -344,7 +344,6 @@ def update_slippage_label(label, iterations, amount, tier_name):
         tier = coinbase_fee_tiers.get(tier_name, default_fee)
         fee_pct = tier["taker"] if use_market_order else tier["maker"]
 
-        # Do not round intermediate calculations with fudge factor
         raw_slippage = amount * fee_pct * 2 * iterations
 
         label.config(text=f"Estimated Slippage: ${raw_slippage:.6f}")
@@ -538,9 +537,8 @@ def run_feeliquidator(amount_limit_entry, iteration_var, wallet_label, volume_la
                 floored_quote = max(floored_quote, 1.00)
                 quote_str = f"{floored_quote:.{quote_precision}f}"
 
-                min_quote_threshold = 1.00
-                if float(quote_str) < min_quote_threshold:
-                    log(f"❌ Skipping order: quote_size ${quote_str} below Coinbase minimum of ${min_quote_threshold:.2f}", "error")
+                if float(quote_str) < 1.00:
+                    log(f"❌ Skipping order: quote_size ${quote_str} below Coinbase minimum.", "error")
                     break
 
                 buy_order = client.create_order(
@@ -553,13 +551,12 @@ def run_feeliquidator(amount_limit_entry, iteration_var, wallet_label, volume_la
                         }
                     }
                 ).to_dict()
-
             else:
                 log(f"BUY {base_size} {product_id} (post-only)", "status")
                 buy_order = place_limit_order(
                     product_id=product_id,
                     side="BUY",
-                    base_size=base_size,
+                    base_size=f"{Decimal(str(base_size)).normalize():f}",
                     post_only=True
                 )
 
@@ -582,13 +579,9 @@ def run_feeliquidator(amount_limit_entry, iteration_var, wallet_label, volume_la
         if not wait_for_order_fill(active_buy_id, timeout=90, should_stop_event=stop_event):
             log("BUY not filled. Cancelling...", "warn")
             if active_buy_id:
-                try:
-                    log(f"Cancelling active BUY order {active_buy_id}...", "warn")
-                    cancel_order(active_buy_id)
-                except Exception as e:
-                    log(f"[ERROR] Exception during cancel attempt: {e}", "error")
+                cancel_order(active_buy_id)
             else:
-                log("[SKIP] No active BUY order to cancel.", "warn")
+                log("⚠️ No active BUY order ID to cancel.", "warn")
             continue
 
         actual_base_size = get_filled_base_size_safe(active_buy_id)
@@ -598,6 +591,8 @@ def run_feeliquidator(amount_limit_entry, iteration_var, wallet_label, volume_la
 
         retry_limit = 50
         sell_id = None
+        sell_fill_success = False
+
         for attempt in range(retry_limit):
             if stop_event.is_set():
                 break
@@ -610,117 +605,183 @@ def run_feeliquidator(amount_limit_entry, iteration_var, wallet_label, volume_la
                     side="SELL",
                     order_configuration={
                         "market_market_ioc": {
-                            "base_size": str(actual_base_size)
+                            "base_size": f"{Decimal(str(actual_base_size)).normalize():f}"
                         }
                     }
                 ).to_dict()
-            else:
-                log(f"SELL {actual_base_size} {product_id} (post-only)", "status")
-                # 🆕 Re-fetch BTC balance to avoid preview rejection
-            try:
-                btc_account = next((a for a in client.get_accounts().accounts if a.currency == "BTC"), None)
-                if not btc_account:
-                    raise ValueError("BTC account not found")
-                available_btc = float(btc_account.available_balance['value'])
-                if available_btc < actual_base_size:
-                    log(f"❌ Failed to repost SELL limit order: Insufficient balance ({available_btc:.8f} BTC available, needed {actual_base_size})", "error")
+
+                if "success_response" in sell_order:
+                    sell_id = sell_order["success_response"]["order_id"]
+                    log("✅ Market SELL succeeded.", "success")
+                    sell_fill_success = True
+
+                    # ✅ Skip all retry/fallback logic
+                    try:
+                        buy_order_data = client.get_order(order_id=active_buy_id).order
+                        buy_value = float(buy_order_data.filled_value or 0)
+                    except Exception as e:
+                        log(f"[WARN] Could not fetch BUY filled value: {e}", "warn")
+                        buy_value = 0.0
+
+                    try:
+                        sell_order_data = client.get_order(order_id=sell_id).order
+                        sell_value = float(sell_order_data.filled_value or 0)
+                    except Exception as e:
+                        log(f"[WARN] Could not fetch SELL filled value: {e}", "warn")
+                        sell_value = 0.0
+
+                    volume_added += buy_value + sell_value
+                    iterations_done += 1
+                    total_spent += adjusted_max_amount
+                    update_wallet_label(wallet_label)
+                    update_spot_volume_label(spot_volume_label)
+                    volume_label.config(text=f"Market Volume Added: ${volume_added:.2f}")
+                    iter_label.config(text=f"Iterations Completed: {iterations_done}")
+                    log(f"Iteration {iterations_done} complete. Total spent: ${total_spent:.2f}", "status")
+                    time.sleep(1)
+                    break  # skip retry logic
+                else:
+                    reason = sell_order.get("error_response", {}).get("message", "Unknown")
+                    log(f"❌ Market SELL failed: {reason}", "error")
                     continue
-            except Exception as e:
-                log(f"❌ Failed to fetch BTC balance before SELL retry: {e}", "error")
-                continue
 
-            sell_order = place_limit_order(
-                product_id=product_id,
-                side="SELL",
-                base_size=available_btc,
-                post_only=True
-            )
-
-            if "success_response" in sell_order:
-                sell_id = sell_order["success_response"]["order_id"]
-                break
             else:
-                reason = sell_order.get("error_response", {}).get("message", "Unknown")
-                log(f"SELL order attempt {attempt+1}/{retry_limit} failed: {reason}", "error")
-                time.sleep(0.5)
+                log(f"SELL {Decimal(str(actual_base_size)).normalize():f} {product_id} (post-only)", "status")
+                try:
+                    btc_account = next((a for a in client.get_accounts().accounts if a.currency == "BTC"), None)
+                    if not btc_account:
+                        raise ValueError("BTC account not found")
+                    available_btc = float(btc_account.available_balance['value'])
+                    if available_btc < actual_base_size:
+                        log(f"❌ Failed to repost SELL limit order: Insufficient balance ({available_btc:.8f} BTC available, needed {actual_base_size})", "error")
+                        continue
+                except Exception as e:
+                    log(f"❌ Failed to fetch BTC balance before SELL retry: {e}", "error")
+                    continue
 
-        if not sell_id:
-            log("❌ All SELL attempts failed. Skipping iteration.", "error")
-            continue
+                sell_order = place_limit_order(
+                    product_id=product_id,
+                    side="SELL",
+                    base_size=actual_base_size,
+                    post_only=True
+                )
 
-        log(f"Waiting for SELL order to fill (ID: {sell_id})", "status")
-        sell_fill_success = False
-        max_sell_timeouts = 50
+                if sell_order and "success_response" in sell_order:
+                    sell_id = sell_order["success_response"]["order_id"]
+                    # 🔁 Wait for first SELL limit order to fill (just like retry loop would)
+                    log(f"[WAIT] Initial wait for SELL order {sell_id} to fill...", "status")
+                    if wait_for_order_fill(sell_id, timeout=90, should_stop_event=stop_event):
+                        log(f"✅ SELL order {sell_id} filled after initial wait.", "success")
+                        sell_fill_success = True
+                        break
+                    else:
+                        log("⏳ SELL order not filled after initial wait. Will enter retry loop.", "warn")
+                    break
 
-        for sell_timeout_attempt in range(max_sell_timeouts):
-            if wait_for_order_fill(sell_id, timeout=90, should_stop_event=stop_event):
-                sell_fill_success = True
-                break
+                else:
+                    reason = sell_order.get("error_response", {}).get("message", "Unknown") if sell_order else "No response from API"
+                    log(f"❌ Failed to repost SELL limit order: {reason}", "error")
+                    sell_id = None  # explicitly clear to avoid invalid cancel
+                    time.sleep(0.5)
 
-            log(f"SELL not filled (attempt {sell_timeout_attempt + 1}/{max_sell_timeouts}). Cancelling and retrying...", "warn")
-            cancel_order(sell_id)
+                if not sell_fill_success and sell_id:
+                    log(f"Waiting for SELL order to fill (ID: {sell_id})", "status")
+                    
+                    max_sell_timeouts = 50
+                    for sell_timeout_attempt in range(max_sell_timeouts):
+                        # Wait first
+                        if wait_for_order_fill(sell_id, timeout=90, should_stop_event=stop_event):
+                            sell_fill_success = True
+                            break
 
-            sell_order = place_limit_order(
-                product_id=product_id,
-                side="SELL",
-                base_size=actual_base_size,
-                post_only=True
-            )
+                        # Check status of order
+                        try:
+                            order = client.get_order(order_id=sell_id).order
+                            if order.status == "FILLED":
+                                log(f"✅ SELL order {sell_id} already filled — marking success.", "success")
+                                sell_fill_success = True
+                                break
+                            elif order.status == "OPEN":
+                                log(f"⏳ SELL order {sell_id} is still open — will retry.", "debug")
+                            else:
+                                log(f"⚠️ SELL order {sell_id} is in unexpected status: {order.status}", "warn")
+                        except Exception as e:
+                            log(f"[WARN] Could not fetch order status for SELL {sell_id}: {e}", "warn")
 
-            if "success_response" in sell_order:
-                sell_id = sell_order["success_response"]["order_id"]
-                log(f"[REPOST] New SELL order ID: {sell_id}", "status")
-            else:
-                reason = sell_order.get("error_response", {}).get("message", "Unknown")
-                log(f"❌ Failed to repost SELL limit order: {reason}", "error")
-                break
+                        # Now check available BTC *before retry*
+                        try:
+                            btc_account = next((a for a in client.get_accounts().accounts if a.currency == "BTC"), None)
+                            if not btc_account:
+                                raise ValueError("BTC account not found")
+                            available_btc = float(btc_account.available_balance['value'])
+
+                            if available_btc < 1e-8:
+                                log(f"❌ Cannot retry Limit SELL — BTC balance is < 1e-8 BTC. Market selling.", "error")
+                                break
+                        except Exception as e:
+                            log(f"❌ Failed to fetch BTC balance before SELL retry: {e}", "error")
+                            break
+
+                        # Retry SELL
+                        log(f"SELL not filled (attempt {sell_timeout_attempt + 1}/{max_sell_timeouts}). Cancelling and retrying...", "warn")
+                        cancel_order(sell_id)
+
+                        sell_order = place_limit_order(
+                            product_id=product_id,
+                            side="SELL",
+                            base_size=actual_base_size,
+                            post_only=True
+                        )
+
+                        if "success_response" in sell_order:
+                            sell_id = sell_order["success_response"]["order_id"]
+                            log(f"[REPOST] New SELL order ID: {sell_id}", "status")
+                        else:
+                            reason = sell_order.get("error_response", {}).get("message", "Unknown")
+                            break
+
+                # 🛠️ FINAL fill check fallback (covers immediate fill case)
+                if not sell_fill_success and sell_id and not stop_event.is_set():
+                    log(f"[WAIT] Final attempt: Waiting for SELL order {sell_id} to fill...", "status")
+                    if wait_for_order_fill(sell_id, timeout=90, should_stop_event=stop_event):
+                        log(f"✅ SELL order {sell_id} filled after initial post.", "success")
+                        sell_fill_success = True
+                    else:
+                        log("⏳ SELL order still not filled after final wait. Proceeding to fallback.", "warn")
 
         if not sell_fill_success:
             log("SELL limit retries exhausted. Executing fallback market sell...", "warn")
-            cancel_order(sell_id)
-            fallback_sell = client.create_order(
-                client_order_id=generate_order_id(),
-                product_id=product_id,
-                side="SELL",
-                order_configuration={
-                    "market_market_ioc": {
-                        "base_size": str(actual_base_size)
-                    }
-                }
-            ).to_dict()
-            if "success_response" in fallback_sell:
-                log("✅ Fallback market SELL succeeded.", "success")
+
+            if sell_id:
+                cancel_order(sell_id)
             else:
-                log("❌ Fallback market SELL failed.", "error")
+                log("⚠️ No valid SELL order ID to cancel.", "warn")
 
-        buy_value = None
-        sell_value = None
+            if actual_base_size <= 0:
+                log("⚠️ Fallback SELL skipped — base size is zero.", "warn")
+            else:
+                fallback_sell = client.create_order(
+                    client_order_id=generate_order_id(),
+                    product_id=product_id,
+                    side="SELL",
+                    order_configuration={
+                        "market_market_ioc": {
+                            "base_size": f"{Decimal(str(actual_base_size)).normalize():f}"
+                        }
+                    }
+                ).to_dict()
 
-        try:
-            buy_order_data = client.get_order(order_id=active_buy_id).order
-            buy_value = float(buy_order_data.filled_value or 0)
-        except Exception as e:
-            log(f"[WARN] Could not fetch BUY filled value: {e}", "warn")
-
-        try:
-            sell_order_data = client.get_order(order_id=sell_id).order
-            sell_value = float(sell_order_data.filled_value or 0)
-        except Exception as e:
-            log(f"[WARN] Could not fetch SELL filled value: {e}", "warn")
-
-        if buy_value is not None and sell_value is not None:
-            volume_added += buy_value + sell_value
-        else:
-            log("[WARN] Skipping volume update due to missing fill value.", "warn")
-
-        iterations_done += 1
-        total_spent += adjusted_max_amount
-        update_wallet_label(wallet_label)
-        update_spot_volume_label(spot_volume_label)
-        volume_label.config(text=f"Market Volume Added: ${volume_added:.2f}")
-        iter_label.config(text=f"Iterations Completed: {iterations_done}")
-        log(f"Iteration {iterations_done} complete. Total spent: ${total_spent:.2f}", "status")
-        time.sleep(1)
+                if "success_response" in fallback_sell:
+                    log("✅ Fallback market SELL succeeded.", "success")
+                    iterations_done += 1  # ← FIXED: count this as a successful iteration
+                    update_wallet_label(wallet_label)
+                    update_spot_volume_label(spot_volume_label)
+                    volume_label.config(text=f"Market Volume Added: ${volume_added:.2f}")
+                    iter_label.config(text=f"Iterations Completed: {iterations_done}")
+                    log(f"Iteration {iterations_done} complete. Total spent: ${total_spent:.2f}", "status")
+                    time.sleep(1)
+                else:
+                    log("❌ Fallback market SELL failed.", "error")
 
     log("Liquidator stopped.", "status")
     end_usd_balance = get_wallet_balance('USD')
