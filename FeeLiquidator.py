@@ -22,6 +22,9 @@ def load_vars_from_json(file_path):
 
 log_queue = queue.Queue()
 use_market_order = False
+amount_limit_entry = None
+iteration_combo = None
+start_btn = None
 
 # Load API credentials
 script_dir = os.path.dirname(os.path.abspath(__file__))
@@ -208,7 +211,7 @@ def update_slippage_label(label, iterations, amount, tier_name):
         fee_pct = tier["taker"] if use_market_order else tier["maker"]
 
         # Do not round intermediate calculations with fudge factor
-        raw_slippage = amount * fee_pct * 2 * iterations / 2.316
+        raw_slippage = amount * fee_pct * 4 * iterations / 2.316
 
         label.config(text=f"Expected Slippage: ${raw_slippage:.6f}")
     except Exception as e:
@@ -268,19 +271,20 @@ def place_limit_order(product_id, side, base_size, post_only=True, max_retries=2
 
             # Hug spread
             spread = best_ask - best_bid
-            if spread < 0.01:
-                spread = 0.01  # fallback to prevent zero spread
+            # Aim to stay just 1 cent off for near-market execution
+            spread = best_ask - best_bid
+            spread = max(spread, 0.01)  # enforce minimum spread
 
-            spread_multiplier = 0.2 + (0.05 * attempt)
-            price_offset = spread * spread_multiplier
+            # Lock to 0.01 offset to ensure post-only while hugging market
+            price_offset = 0.01
 
             if limit_price is not None:
                 price = limit_price
             else:
                 if side == "BUY":
-                    price = round(best_ask - price_offset, 2)
+                    price = round(best_ask - price_offset, 8)
                 else:
-                    price = round(best_bid + price_offset, 2)
+                    price = round(best_bid + price_offset, 8)
 
             # Reassess if price matches market (post-only would fail)
             if (side == "BUY" and price >= best_ask) or (side == "SELL" and price <= best_bid):
@@ -362,6 +366,9 @@ def run_feeliquidator(amount_limit_entry, iteration_var, wallet_label, volume_la
         return
 
     total_spent = 0.0
+    tier = coinbase_fee_tiers.get(selected_fee_tier_name, default_fee)
+    fee_pct = tier["maker"] if not use_market_order else tier["taker"]
+    adjusted_max_amount = max_amount / (1 + 2 * fee_pct)
 
     while running and iterations_done < target_iterations:
         if stop_event.is_set():
@@ -383,7 +390,7 @@ def run_feeliquidator(amount_limit_entry, iteration_var, wallet_label, volume_la
 
         precision = get_precision_fallback(product_id)
         buy_price = round(market_price * 0.999, 2 if market_price >= 1 else 4)
-        base_size = round(max_amount / buy_price, precision)
+        base_size = round(adjusted_max_amount / buy_price, precision)
 
         if use_market_order:
             log(f"BUY {base_size} {product_id} @ market", "status")
@@ -416,17 +423,50 @@ def run_feeliquidator(amount_limit_entry, iteration_var, wallet_label, volume_la
 
         active_buy_id = buy_order["success_response"]["order_id"]
         log(f"Waiting for BUY order to fill (ID: {active_buy_id})", "status")
-        filled = wait_for_order_fill(active_buy_id, should_stop_event=stop_event)
-        if not filled:
-            log("Cancelling BUY order due to stop request...", "warn")
-            success = cancel_order(active_buy_id)
-            restore_controls(amount_limit_entry, iteration_combo, start_btn, status_var, status_label, volume_label, iter_label)
-            if success:
-                log("BUY order successfully cancelled.", "success")
-            else:
-                log("❌ Failed to cancel BUY order.", tag="error")
-            break
-        log(f"[FILLED] BUY order filled.", tag="success")
+        buy_timeout = 150
+        filled = False
+
+        actual_base_size = base_size  # fallback
+        try:
+            order = client.get_order(order_id=active_buy_id).order
+            if order.status == "FILLED" and order.filled_size:
+                actual_base_size = float(order.filled_size)
+                log(f"Actual filled size: {actual_base_size} BTC", "debug")
+        except Exception as e:
+            log(f"Error getting filled size: {e}", "error")
+
+        buy_timeout = 150
+        filled = False
+        while not filled and not stop_event.is_set():
+            filled = wait_for_order_fill(active_buy_id, timeout=buy_timeout, should_stop_event=stop_event)
+            if filled or stop_event.is_set():
+                break
+
+            log("BUY order not filled in time. Cancelling and retrying...", "warn")
+            cancel_order(active_buy_id)
+            time.sleep(0.5)
+            log("Re-posting new BUY order...", "warn")
+
+            # Recalculate order
+            market_price = get_current_price_fallback(client, product_id)
+            if market_price is None:
+                log("No price data on retry. Aborting.", "error")
+                break
+
+            buy_price = round(market_price * 0.999, 8)
+            base_size = round(adjusted_max_amount / buy_price, precision)
+            buy_order = place_limit_order(
+                product_id=product_id,
+                side="BUY",
+                base_size=base_size,
+                post_only=True
+            )
+
+            if "success_response" not in buy_order:
+                log("Retry BUY order failed.", "error")
+                break
+
+            active_buy_id = buy_order["success_response"]["order_id"]
 
         active_buy_id = None
 
@@ -438,7 +478,7 @@ def run_feeliquidator(amount_limit_entry, iteration_var, wallet_label, volume_la
                 side="SELL",
                 order_configuration={
                     "market_market_ioc": {
-                        "base_size": str(base_size)
+                        "base_size": str(actual_base_size)
                     }
                 }
             ).to_dict()
@@ -464,8 +504,87 @@ def run_feeliquidator(amount_limit_entry, iteration_var, wallet_label, volume_la
 
         sell_id = sell_order["success_response"]["order_id"]
         log(f"Waiting for SELL order to fill (ID: {sell_id})", "status")
-        wait_for_order_fill(sell_id)
-        log(f"SELL order filled.", "status")
+        sell_timeout = 150
+        filled = False
+
+        while not filled and not stop_event.is_set():
+            filled = wait_for_order_fill(sell_id, timeout=sell_timeout, should_stop_event=stop_event)
+            if filled:
+                break
+
+            if stop_event.is_set():
+                log("Stop triggered. Cancelling active SELL order...", "warn")
+                cancel_order(sell_id)
+                wallet_btc = get_wallet_balance('BTC')
+                if wallet_btc < base_size:
+                    log(f"⛔ Skipping fallback sell — not enough BTC in wallet. Have: {wallet_btc:.8f}, need: {base_size:.8f}", "error")
+                    break
+
+                log("Fallback: Placing MARKET SELL due to stop...", "warn")
+                fallback_sell = client.create_order(
+                    client_order_id=generate_order_id(),
+                    product_id=product_id,
+                    side="SELL",
+                    order_configuration={
+                        "market_market_ioc": {
+                            "base_size": str(actual_base_size)
+                        }
+                    }
+                ).to_dict()
+
+                if "success_response" in fallback_sell:
+                    log("✅ Fallback market SELL placed successfully.", "success")
+                else:
+                    log("❌ Fallback market SELL failed.", "error")
+                break
+
+            log("SELL order not filled in time. Cancelling and retrying...", "warn")
+            cancel_order(sell_id)
+            time.sleep(0.5)
+            log("Re-posting new SELL order...", "warn")
+
+            market_price = get_current_price_fallback(client, product_id)
+            if market_price is None:
+                log("No price data on retry. Aborting.", "error")
+                break
+
+            sell_price = round(market_price * 1.001, 8)
+            sell_order = place_limit_order(
+                product_id=product_id,
+                side="SELL",
+                base_size=base_size,
+                limit_price=sell_price,
+                post_only=True
+            )
+
+            if "success_response" not in sell_order:
+                log("Retry SELL order failed.", "error")
+                break
+
+
+
+            sell_id = sell_order["success_response"]["order_id"]
+
+        if not filled and not stop_event.is_set():
+            log("Final SELL attempt failed. Attempting fallback market SELL.", "warn")
+            cancel_order(sell_id)
+            fallback_sell = client.create_order(
+                client_order_id=generate_order_id(),
+                product_id=product_id,
+                side="SELL",
+                order_configuration={
+                    "market_market_ioc": {
+                        "base_size": str(actual_base_size)
+                    }
+                }
+            ).to_dict()
+            if "success_response" in fallback_sell:
+                log("✅ Fallback market SELL placed after retries.", "success")
+            else:
+                log("❌ Fallback market SELL failed.", "error")
+        else:
+            log("Final SELL attempt skipped — stop was already handled.", "warn")
+
         if use_market_order:
             volume_added += base_size * market_price * 2
         else:
@@ -497,12 +616,50 @@ def run_feeliquidator(amount_limit_entry, iteration_var, wallet_label, volume_la
 stop_event = Event()
 
 def stop_feeliquidator():
-    global running
+    global running, active_buy_id
     if not running:
         return
     log("Stop requested.", tag="warn")
     stop_event.set()
     running = False
+
+    if active_buy_id:
+        log(f"Cancelling active BUY order {active_buy_id}...", "warn")
+        cancel_order(active_buy_id)
+        active_buy_id = None
+
+    # Cancel all open SELL orders and fallback to market sell only once
+    try:
+        accounts = client.get_accounts().accounts
+        btc_account = next((a for a in accounts if a.currency == "BTC"), None)
+        if btc_account:
+            btc_balance = float(btc_account.available_balance['value'])
+            if btc_balance > 0:
+                log(f"Fallback: Market selling {btc_balance:.8f} BTC due to stop...", "warn")
+                fallback_sell = client.create_order(
+                    client_order_id=generate_order_id(),
+                    product_id="BTC-USD",
+                    side="SELL",
+                    order_configuration={
+                        "market_market_ioc": {
+                            "base_size": str(btc_balance)
+                        }
+                    }
+                ).to_dict()
+                if "success_response" in fallback_sell:
+                    log("✅ Emergency fallback market SELL completed.", "success")
+                else:
+                    log("❌ Emergency fallback market SELL failed.", "error")
+    except Exception as e:
+        log(f"[ERROR] Exception during emergency SELL: {e}", "error")
+
+    # Try UI control restore safely
+    try:
+        for control in (start_btn, iteration_combo, amount_limit_entry):
+            if control and hasattr(control, "config"):
+                control.config(state="normal")
+    except Exception as e:
+        log(f"[WARN] Failed to re-enable controls: {e}", "warn")
 
 def poll_log_queue(log_widget):
     while not log_queue.empty():
@@ -521,6 +678,7 @@ def bind_enter_key_to_buttons(root):
     root.bind("<KP_Enter>", on_enter_key)  # Support numpad Enter
 
 def start_gui():
+    global amount_limit_entry, iteration_combo, start_btn, stop_btn
     root = tk.Tk()
     status_var = tk.StringVar(value="🟡 Status: Idle")
     root.title("Fee Liquidator")
@@ -652,6 +810,7 @@ def start_gui():
 
     stop_btn = tk.Button(control_frame, text="Stop", command=stop_feeliquidator, bg="red", fg="white", font=("Helvetica", 12))
     stop_btn.pack(pady=5)
+
 
     # Logging Panel
     log_frame = tk.Frame(main_frame, bg="#1e1e1e", width=400)
