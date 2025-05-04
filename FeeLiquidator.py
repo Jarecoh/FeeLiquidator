@@ -8,9 +8,11 @@ from tkinter import scrolledtext, ttk
 import queue
 import uuid
 import sys
+from itertools import cycle
 import numpy as np
 from threading import Event
 from coinbase.rest import RESTClient
+from decimal import Decimal, ROUND_DOWN, getcontext, ROUND_UP
 
 def load_vars_from_json(file_path):
     try:
@@ -25,6 +27,7 @@ use_market_order = False
 amount_limit_entry = None
 iteration_combo = None
 start_btn = None
+CUTOFF_DAYS = 30
 
 # Load API credentials
 script_dir = os.path.dirname(os.path.abspath(__file__))
@@ -72,7 +75,8 @@ def log(msg, tag="info"):
     if any(kw in msg for kw in [
         "BUY", "SELL",
         "[FILL]", "Starting iteration",
-        "Iteration", "💸 Net USD loss", "✅ Net USD gain"
+        "Iteration", "💸 Net USD loss", "✅ Net USD gain",
+        "Total runtime"
     ]):
         write_trade_log(formatted_msg)
 
@@ -150,6 +154,17 @@ def get_precision_fallback(product_id):
         log(f"Failed to fetch precision for {product_id}: {e}", "error")
         return 4
 
+def get_price_precision(product_id):
+    try:
+        product = client.get_product(product_id=product_id)
+        increment = product.quote_increment
+        if "." in increment:
+            return len(increment.split(".")[1].rstrip("0"))
+        return 0
+    except Exception as e:
+        log(f"Failed to fetch price precision for {product_id}: {e}", "error")
+        return 2  # Safe fallback
+
 def wait_for_order_fill(order_id, timeout=None, poll_interval=2, should_stop_event=None):
     log(f"[WAIT] Waiting for order {order_id} to fill...", "status")
     start = time.time()
@@ -170,6 +185,14 @@ def wait_for_order_fill(order_id, timeout=None, poll_interval=2, should_stop_eve
             log(f"[TIMEOUT] Order {order_id} not filled after {timeout} seconds.", "warn")
             return False
         time.sleep(poll_interval)
+
+def get_filled_base_size_safe(order_id):
+    try:
+        order = client.get_order(order_id=order_id).order
+        return float(order.filled_size) if order.filled_size else None
+    except Exception as e:
+        log(f"Error getting filled size: {e}", "error")
+        return None
 
 def update_status(text, status_var, status_label, bg_color="#444", fg_color="white"):
     status_var.set(text)
@@ -205,17 +228,128 @@ def update_wallet_label(label):
     balance = get_wallet_balance('USD')
     label.config(text=f"USD Wallet: ${balance:.2f}")
 
+def get_spot_volume():
+    from datetime import datetime, timedelta, timezone
+
+    try:
+        cutoff = datetime.now(timezone.utc) - timedelta(days=CUTOFF_DAYS)
+        spot_volume = 0.0
+        cursor = None
+        done = False  # <-- Flag to indicate cutoff reached
+
+        while not done:
+            response = client.list_orders(limit=100, cursor=cursor).to_dict()
+            orders = response.get("orders", [])
+
+            for order in orders:
+                created_at = datetime.fromisoformat(order["created_time"].replace("Z", "+00:00"))
+                if created_at < cutoff:
+                    done = True
+                    break  # exit the inner for-loop, outer while checks `done`
+
+                filled_value = order.get("filled_value")
+                if not filled_value:
+                    size = float(order.get("filled_size") or 0)
+                    avg_price = float(order.get("average_filled_price") or 0)
+                    filled_value = size * avg_price
+                else:
+                    filled_value = float(filled_value)
+
+                order_type = order.get("order_type", "").lower()
+                product_type = order.get("product_type", "").lower()
+
+                if order_type in ["futures", "futures_contract"] or product_type in ["futures", "futures_contract"]:
+                    continue
+
+                product_id = order.get("product_id", "")
+                parts = product_id.split("-")
+                if len(parts) < 2:
+                    continue
+                base, quote = parts[0], parts[-1]
+
+                if quote != "USD" or base in ["USDC", "USDT", "DAI"]:
+                    continue
+
+                spot_volume += filled_value
+
+            cursor = response.get("cursor")
+            if not orders or not cursor:
+                break
+
+        return round(spot_volume, 2)
+
+    except Exception as e:
+        log(f"[WARN] Failed to get {CUTOFF_DAYS}d spot volume: {e}")
+        return 0.0
+
+def update_spot_volume_label(label):
+    from datetime import datetime, timedelta, timezone
+
+    try:
+        cutoff = datetime.now(timezone.utc) - timedelta(days=45)
+        spot_volume = 0.0
+        cursor = None
+
+        while True:
+            response = client.list_orders(limit=100, cursor=cursor).to_dict()
+            orders = response.get("orders", [])
+
+            for order in orders:
+                created_at = datetime.fromisoformat(order["created_time"].replace("Z", "+00:00"))
+                if created_at < cutoff:
+                    continue
+
+                if order["status"] != "FILLED":
+                    continue
+
+                filled_value = order.get("filled_value")
+                if not filled_value:
+                    size = float(order.get("filled_size") or 0)
+                    avg_price = float(order.get("average_filled_price") or 0)
+                    filled_value = size * avg_price
+                else:
+                    filled_value = float(filled_value)
+
+                order_type = order.get("order_type", "").lower()
+                product_type = order.get("product_type", "").lower()
+
+                if order_type in ["futures", "futures_contract"] or product_type in ["futures", "futures_contract"]:
+                    futures_volume += filled_value
+                    continue
+
+                product_id = order.get("product_id", "")
+                parts = product_id.split("-")
+                if len(parts) < 2:
+                    continue
+                base, quote = parts[0], parts[-1]
+
+                if quote != "USD" or base in ["USDC", "USDT", "DAI"]:
+                    continue
+
+                spot_volume += filled_value
+
+            cursor = response.get("cursor")
+            if not orders or not cursor:
+                break
+
+        label.config(text=f"{CUTOFF_DAYS}-Day Spot Volume: ${spot_volume:,.2f}")
+        log(f"📊 {CUTOFF_DAYS}-Day Spot Volume: ${spot_volume:,.2f}")
+
+    except Exception as e:
+        log(f"[WARN] Failed to update 30-day spot volume: {e}")
+        label.config(text=f"{CUTOFF_DAYS}-Day Spot Volume: $ERR")
+
 def update_slippage_label(label, iterations, amount, tier_name):
     try:
         tier = coinbase_fee_tiers.get(tier_name, default_fee)
         fee_pct = tier["taker"] if use_market_order else tier["maker"]
 
         # Do not round intermediate calculations with fudge factor
-        raw_slippage = amount * fee_pct * 4 * iterations / 2.316
+        raw_slippage = amount * fee_pct * 2 * iterations
 
-        label.config(text=f"Expected Slippage: ${raw_slippage:.6f}")
+        label.config(text=f"Estimated Slippage: ${raw_slippage:.6f}")
     except Exception as e:
-        label.config(text="Expected Slippage: Error")
+        label.config(text="Estimated Slippage: Error")
         log(f"Failed to update slippage: {e}", "error")
 
 def get_historical_data(client, market="BTC-USD", granularity="ONE_MINUTE", limit=100):
@@ -249,13 +383,12 @@ def get_historical_data(client, market="BTC-USD", granularity="ONE_MINUTE", limi
         return None
 
 def place_limit_order(product_id, side, base_size, post_only=True, max_retries=200, limit_price=None):
-    import json
     for attempt in range(max_retries):
         try:
+            price_precision = get_price_precision(product_id)
+            getcontext().prec = 20
             book = client.get_product_book(product_id=product_id, level=1)
             data = book.to_dict()
-            if attempt == 0:
-                log(f"[DEBUG] Raw book response: {json.dumps(data)[:1000]}...", "warn")  # limit to 1000 chars
 
             book_data = data.get("pricebook", {})
             bids = book_data.get("bids", [])
@@ -268,33 +401,31 @@ def place_limit_order(product_id, side, base_size, post_only=True, max_retries=2
 
             best_bid = float(bids[0]['price'])
             best_ask = float(asks[0]['price'])
+            spread = max(best_ask - best_bid, 0.01)  # enforce minimum spread
 
-            # Hug spread
-            spread = best_ask - best_bid
-            # Aim to stay just 1 cent off for near-market execution
-            spread = best_ask - best_bid
-            spread = max(spread, 0.01)  # enforce minimum spread
+            tick = Decimal("1") / Decimal("10")**price_precision
+            price = None
 
-            # Lock to 0.01 offset to ensure post-only while hugging market
-            price_offset = 0.01
+            if side == "BUY":
+                ref_price = Decimal(str(best_bid))
+                price = (ref_price - tick).quantize(tick, rounding=ROUND_DOWN)
+                if float(price) >= best_ask:
+                    log(f"[Retry {attempt + 1}] Limit price would match market — reassessing...", "warn")
+                    time.sleep(0.1)
+                    continue
 
-            if limit_price is not None:
-                price = limit_price
-            else:
-                if side == "BUY":
-                    price = round(best_ask - price_offset, 8)
-                else:
-                    price = round(best_bid + price_offset, 8)
-
-            # Reassess if price matches market (post-only would fail)
-            if (side == "BUY" and price >= best_ask) or (side == "SELL" and price <= best_bid):
-                log(f"[Retry {attempt + 1}] Limit price would match market — reassessing...", "warn")
-                time.sleep(0.1)
-                continue
+            elif side == "SELL":
+                ref_price = Decimal(str(best_ask))
+                price = (ref_price + tick).quantize(tick, rounding=ROUND_UP)
+                if float(price) <= best_bid:
+                    log(f"[Retry {attempt + 1}] Limit price would match market — reassessing...", "warn")
+                    time.sleep(0.1)
+                    continue
 
             order_id = generate_order_id()
-            log(f"[SPREAD] Best bid: {best_bid}, Best ask: {best_ask}, Spread: {spread:.2f}", "status")
-            log(f"{side} {base_size} @ {price} (post_only={post_only}) | ID: {order_id}", "status")
+            if attempt == 0 or attempt % 50 == 49:
+                log(f"[SPREAD] Best bid: {best_bid}, Best ask: {best_ask}, Spread: {spread:.2f}", "status")
+                log(f"{side} {base_size} @ {price} (post_only={post_only}) | ID: {order_id}", "status")
 
             response = client.create_order(
                 client_order_id=order_id,
@@ -302,8 +433,8 @@ def place_limit_order(product_id, side, base_size, post_only=True, max_retries=2
                 side=side,
                 order_configuration={
                     "limit_limit_gtc": {
-                        "base_size": str(base_size),
-                        "limit_price": str(price),
+                        "limit_price": format(price, 'f'),
+                        "base_size": format(Decimal(str(base_size)).normalize(), 'f'),
                         "post_only": post_only
                     }
                 }
@@ -314,7 +445,8 @@ def place_limit_order(product_id, side, base_size, post_only=True, max_retries=2
 
             reason = response.get("error_response", {}).get("preview_failure_reason", "")
             if "would execute" in reason.lower() or "too close" in reason.lower():
-                log(f"[Retry {attempt + 1}] Price too close to market — adjusting...", "warn")
+                if attempt % 50 == 49:
+                    log(f"[Retry {attempt + 1}] Still too close to market. Reason: {reason}", "warn")
                 time.sleep(0.2)
                 continue
 
@@ -325,7 +457,7 @@ def place_limit_order(product_id, side, base_size, post_only=True, max_retries=2
             log(f"[ERROR] Exception placing order: {repr(e)}", "error")
             time.sleep(0.1)
 
-    log("❌ Max retries reached without successful post-only order.", "error")
+    log(f"❌ Max retries reached placing {side} on {product_id}. Gave up hugging market.", "error")
     return {
         "success": False,
         "error_response": {
@@ -345,8 +477,9 @@ def restore_controls(amount_limit_entry, iteration_combo, start_btn, status_var,
     iter_label.config(text=f"Iterations Completed: {iterations_done}")
     stop_event.clear()
 
-def run_feeliquidator(amount_limit_entry, iteration_var, wallet_label, volume_label, iter_label, status_var, status_label, start_btn, iteration_combo, real_slippage_label):
+def run_feeliquidator(amount_limit_entry, iteration_var, wallet_label, volume_label, iter_label, status_var, status_label, start_btn, iteration_combo, real_slippage_label, spot_volume_label):
     global running, volume_added, iterations_done, active_buy_id
+    start_time = time.time()
     start_usd_balance = get_wallet_balance('USD')
     running = True
     iterations_done = 0
@@ -368,7 +501,8 @@ def run_feeliquidator(amount_limit_entry, iteration_var, wallet_label, volume_la
     total_spent = 0.0
     tier = coinbase_fee_tiers.get(selected_fee_tier_name, default_fee)
     fee_pct = tier["maker"] if not use_market_order else tier["taker"]
-    adjusted_max_amount = max_amount / (1 + 2 * fee_pct)
+    reserved_fee = max_amount * 2 * fee_pct
+    adjusted_max_amount = max(max_amount - reserved_fee, 1.00)
 
     while running and iterations_done < target_iterations:
         if stop_event.is_set():
@@ -376,10 +510,10 @@ def run_feeliquidator(amount_limit_entry, iteration_var, wallet_label, volume_la
             break
 
         log(f"Starting iteration {iterations_done + 1} of {target_iterations}", "status")
-        
+
         usd_balance = get_wallet_balance('USD')
         log(f"USD Balance: ${usd_balance:.2f}", "status")
-        if usd_balance < max_amount:
+        if usd_balance < adjusted_max_amount:
             log("⚠️ Not enough USD for next cycle.", "warning")
             break
 
@@ -389,139 +523,88 @@ def run_feeliquidator(amount_limit_entry, iteration_var, wallet_label, volume_la
             break
 
         precision = get_precision_fallback(product_id)
-        buy_price = round(market_price * 0.999, 2 if market_price >= 1 else 4)
-        base_size = round(adjusted_max_amount / buy_price, precision)
+        base_size = round(adjusted_max_amount / market_price, precision)
 
-        if use_market_order:
-            log(f"BUY {base_size} {product_id} @ market", "status")
-            buy_order = client.create_order(
-                client_order_id=generate_order_id(),
-                product_id=product_id,
-                side="BUY",
-                order_configuration={
-                    "market_market_ioc": {
-                        "quote_size": str(max_amount)
-                    }
-                }
-            ).to_dict()
-        else:
-            log(f"BUY {base_size} {product_id} @ {buy_price} (post-only)", "status")
-            buy_order = place_limit_order(
-                product_id=product_id,
-                side="BUY",
-                base_size=base_size,
-                post_only=True
-            )
-
-        if "success_response" not in buy_order:
-            error = buy_order.get("error_response", {})
-            reason = error.get("preview_failure_reason") or error.get("message") or "Unknown"
-            log(f"Buy order failed: {reason}", "error")
-            log(f"↳ Full error: {error}", "error")
-            restore_controls(amount_limit_entry, iteration_combo, start_btn, status_var, status_label, volume_label, iter_label)
-            break
-
-        active_buy_id = buy_order["success_response"]["order_id"]
-        log(f"Waiting for BUY order to fill (ID: {active_buy_id})", "status")
-        buy_timeout = 150
-        filled = False
-
-        actual_base_size = base_size  # fallback
-        try:
-            order = client.get_order(order_id=active_buy_id).order
-            if order.status == "FILLED" and order.filled_size:
-                actual_base_size = float(order.filled_size)
-                log(f"Actual filled size: {actual_base_size} BTC", "debug")
-        except Exception as e:
-            log(f"Error getting filled size: {e}", "error")
-
-        buy_timeout = 150
-        filled = False
-        while not filled and not stop_event.is_set():
-            filled = wait_for_order_fill(active_buy_id, timeout=buy_timeout, should_stop_event=stop_event)
-            if filled or stop_event.is_set():
-                break
-
-            log("BUY order not filled in time. Cancelling and retrying...", "warn")
-            cancel_order(active_buy_id)
-            time.sleep(0.5)
-            log("Re-posting new BUY order...", "warn")
-
-            # Recalculate order
-            market_price = get_current_price_fallback(client, product_id)
-            if market_price is None:
-                log("No price data on retry. Aborting.", "error")
-                break
-
-            buy_price = round(market_price * 0.999, 8)
-            base_size = round(adjusted_max_amount / buy_price, precision)
-            buy_order = place_limit_order(
-                product_id=product_id,
-                side="BUY",
-                base_size=base_size,
-                post_only=True
-            )
-
-            if "success_response" not in buy_order:
-                log("Retry BUY order failed.", "error")
-                break
-
-            active_buy_id = buy_order["success_response"]["order_id"]
-
-        active_buy_id = None
-
-        if use_market_order:
-            log(f"SELL {base_size} {product_id} @ market", "status")
-            sell_order = client.create_order(
-                client_order_id=generate_order_id(),
-                product_id=product_id,
-                side="SELL",
-                order_configuration={
-                    "market_market_ioc": {
-                        "base_size": str(actual_base_size)
-                    }
-                }
-            ).to_dict()
-        else:
-            sell_price = round(market_price * 1.001, 2 if market_price >= 1 else 4)
-            log(f"SELL {base_size} {product_id} @ {sell_price} (post-only)", "status")
-
-            sell_order = place_limit_order(
-                product_id=product_id,
-                side="SELL",
-                base_size=base_size,
-                limit_price=sell_price,
-                post_only=True
-            )
-
-
-        if "success_response" not in sell_order:
-            error = sell_order.get("error_response", {})
-            reason = error.get("preview_failure_reason") or error.get("message") or "Unknown"
-            log(f"Sell order failed: {reason}", "error")
-            log(f"↳ Full error: {error}", "error")
-            break
-
-        sell_id = sell_order["success_response"]["order_id"]
-        log(f"Waiting for SELL order to fill (ID: {sell_id})", "status")
-        sell_timeout = 150
-        filled = False
-
-        while not filled and not stop_event.is_set():
-            filled = wait_for_order_fill(sell_id, timeout=sell_timeout, should_stop_event=stop_event)
-            if filled:
-                break
-
+        retry_limit = 3
+        for attempt in range(retry_limit):
             if stop_event.is_set():
-                log("Stop triggered. Cancelling active SELL order...", "warn")
-                cancel_order(sell_id)
-                wallet_btc = get_wallet_balance('BTC')
-                if wallet_btc < base_size:
-                    log(f"⛔ Skipping fallback sell — not enough BTC in wallet. Have: {wallet_btc:.8f}, need: {base_size:.8f}", "error")
+                break
+
+            if use_market_order:
+                log(f"BUY {base_size} {product_id} @ market", "status")
+                quote_precision = get_price_precision(product_id)
+                quote_unit = 10 ** (-quote_precision)
+                floored_quote = (adjusted_max_amount // quote_unit) * quote_unit
+                floored_quote = max(floored_quote, 1.00)
+                quote_str = f"{floored_quote:.{quote_precision}f}"
+
+                min_quote_threshold = 1.00
+                if float(quote_str) < min_quote_threshold:
+                    log(f"❌ Skipping order: quote_size ${quote_str} below Coinbase minimum of ${min_quote_threshold:.2f}", "error")
                     break
 
-                log("Fallback: Placing MARKET SELL due to stop...", "warn")
-                fallback_sell = client.create_order(
+                buy_order = client.create_order(
+                    client_order_id=generate_order_id(),
+                    product_id=product_id,
+                    side="BUY",
+                    order_configuration={
+                        "market_market_ioc": {
+                            "quote_size": quote_str
+                        }
+                    }
+                ).to_dict()
+
+            else:
+                log(f"BUY {base_size} {product_id} (post-only)", "status")
+                buy_order = place_limit_order(
+                    product_id=product_id,
+                    side="BUY",
+                    base_size=base_size,
+                    post_only=True
+                )
+
+            if "success_response" in buy_order:
+                active_buy_id = buy_order["success_response"]["order_id"]
+                break
+            else:
+                error = buy_order.get("error_response", {})
+                reason = error.get("preview_failure_reason") or error.get("message") or "Unknown"
+                log(f"Buy order attempt {attempt+1}/{retry_limit} failed: {reason}", "error")
+                if attempt + 1 < retry_limit:
+                    log("Retrying BUY order...", "warn")
+                    time.sleep(0.5)
+
+        if not active_buy_id:
+            log("❌ All BUY attempts failed. Skipping iteration.", "error")
+            continue
+
+        log(f"Waiting for BUY order to fill (ID: {active_buy_id})", "status")
+        if not wait_for_order_fill(active_buy_id, timeout=150, should_stop_event=stop_event):
+            log("BUY not filled. Cancelling...", "warn")
+            if active_buy_id:
+                try:
+                    log(f"Cancelling active BUY order {active_buy_id}...", "warn")
+                    cancel_order(active_buy_id)
+                except Exception as e:
+                    log(f"[ERROR] Exception during cancel attempt: {e}", "error")
+            else:
+                log("[SKIP] No active BUY order to cancel.", "warn")
+            continue
+
+        actual_base_size = get_filled_base_size_safe(active_buy_id)
+        if actual_base_size is None or actual_base_size == 0:
+            log("❌ Could not determine filled size. Skipping iteration.", "error")
+            continue
+
+        retry_limit = 3
+        sell_id = None
+        for attempt in range(retry_limit):
+            if stop_event.is_set():
+                break
+
+            if use_market_order:
+                log(f"SELL {actual_base_size} {product_id} @ market", "status")
+                sell_order = client.create_order(
                     client_order_id=generate_order_id(),
                     product_id=product_id,
                     side="SELL",
@@ -531,42 +614,56 @@ def run_feeliquidator(amount_limit_entry, iteration_var, wallet_label, volume_la
                         }
                     }
                 ).to_dict()
+            else:
+                log(f"SELL {actual_base_size} {product_id} (post-only)", "status")
+                sell_order = place_limit_order(
+                    product_id=product_id,
+                    side="SELL",
+                    base_size=actual_base_size,
+                    post_only=True
+                )
 
-                if "success_response" in fallback_sell:
-                    log("✅ Fallback market SELL placed successfully.", "success")
-                else:
-                    log("❌ Fallback market SELL failed.", "error")
+            if "success_response" in sell_order:
+                sell_id = sell_order["success_response"]["order_id"]
+                break
+            else:
+                reason = sell_order.get("error_response", {}).get("message", "Unknown")
+                log(f"SELL order attempt {attempt+1}/{retry_limit} failed: {reason}", "error")
+                time.sleep(0.5)
+
+        if not sell_id:
+            log("❌ All SELL attempts failed. Skipping iteration.", "error")
+            continue
+
+        log(f"Waiting for SELL order to fill (ID: {sell_id})", "status")
+        sell_fill_success = False
+        max_sell_timeouts = 50
+
+        for sell_timeout_attempt in range(max_sell_timeouts):
+            if wait_for_order_fill(sell_id, timeout=90, should_stop_event=stop_event):
+                sell_fill_success = True
                 break
 
-            log("SELL order not filled in time. Cancelling and retrying...", "warn")
+            log(f"SELL not filled (attempt {sell_timeout_attempt + 1}/{max_sell_timeouts}). Cancelling and retrying...", "warn")
             cancel_order(sell_id)
-            time.sleep(0.5)
-            log("Re-posting new SELL order...", "warn")
 
-            market_price = get_current_price_fallback(client, product_id)
-            if market_price is None:
-                log("No price data on retry. Aborting.", "error")
-                break
-
-            sell_price = round(market_price * 1.001, 8)
             sell_order = place_limit_order(
                 product_id=product_id,
                 side="SELL",
-                base_size=base_size,
-                limit_price=sell_price,
+                base_size=actual_base_size,
                 post_only=True
             )
 
-            if "success_response" not in sell_order:
-                log("Retry SELL order failed.", "error")
+            if "success_response" in sell_order:
+                sell_id = sell_order["success_response"]["order_id"]
+                log(f"[REPOST] New SELL order ID: {sell_id}", "status")
+            else:
+                reason = sell_order.get("error_response", {}).get("message", "Unknown")
+                log(f"❌ Failed to repost SELL limit order: {reason}", "error")
                 break
 
-
-
-            sell_id = sell_order["success_response"]["order_id"]
-
-        if not filled and not stop_event.is_set():
-            log("Final SELL attempt failed. Attempting fallback market SELL.", "warn")
+        if not sell_fill_success:
+            log("SELL limit retries exhausted. Executing fallback market sell...", "warn")
             cancel_order(sell_id)
             fallback_sell = client.create_order(
                 client_order_id=generate_order_id(),
@@ -579,20 +676,34 @@ def run_feeliquidator(amount_limit_entry, iteration_var, wallet_label, volume_la
                 }
             ).to_dict()
             if "success_response" in fallback_sell:
-                log("✅ Fallback market SELL placed after retries.", "success")
+                log("✅ Fallback market SELL succeeded.", "success")
             else:
                 log("❌ Fallback market SELL failed.", "error")
-        else:
-            log("Final SELL attempt skipped — stop was already handled.", "warn")
 
-        if use_market_order:
-            volume_added += base_size * market_price * 2
+        buy_value = None
+        sell_value = None
+
+        try:
+            buy_order_data = client.get_order(order_id=active_buy_id).order
+            buy_value = float(buy_order_data.filled_value or 0)
+        except Exception as e:
+            log(f"[WARN] Could not fetch BUY filled value: {e}", "warn")
+
+        try:
+            sell_order_data = client.get_order(order_id=sell_id).order
+            sell_value = float(sell_order_data.filled_value or 0)
+        except Exception as e:
+            log(f"[WARN] Could not fetch SELL filled value: {e}", "warn")
+
+        if buy_value is not None and sell_value is not None:
+            volume_added += buy_value + sell_value
         else:
-            volume_added += base_size * (buy_price + sell_price)
+            log("[WARN] Skipping volume update due to missing fill value.", "warn")
 
         iterations_done += 1
-        total_spent += max_amount
+        total_spent += adjusted_max_amount
         update_wallet_label(wallet_label)
+        update_spot_volume_label(spot_volume_label)
         volume_label.config(text=f"Market Volume Added: ${volume_added:.2f}")
         iter_label.config(text=f"Iterations Completed: {iterations_done}")
         log(f"Iteration {iterations_done} complete. Total spent: ${total_spent:.2f}", "status")
@@ -610,6 +721,11 @@ def run_feeliquidator(amount_limit_entry, iteration_var, wallet_label, volume_la
     if not stop_event.is_set():
         real_slippage_label.config(text=f"Real Slippage: ${usd_diff:.4f}")
         log("✅ All iterations complete.", "success")
+
+        elapsed = time.time() - start_time
+        minutes, seconds = divmod(elapsed, 60)
+        runtime_str = f"⏱️ Total runtime: {int(minutes)}m {seconds:.1f}s"
+        log(runtime_str, "success")
 
     update_wallet_label(wallet_label)
 
@@ -642,7 +758,7 @@ def stop_feeliquidator():
                     side="SELL",
                     order_configuration={
                         "market_market_ioc": {
-                            "base_size": str(btc_balance)
+                            "base_size": f"{btc_balance:.{get_precision_fallback(product_id)}f}"
                         }
                     }
                 ).to_dict()
@@ -694,10 +810,44 @@ def start_gui():
     control_frame.pack(side=tk.LEFT, fill=tk.Y, expand=False)
     control_frame.pack_propagate(False)
 
-    tk.Label(control_frame, text="Fee Liquidator", fg="white", bg="#1e1e1e", font=("Helvetica", 16)).pack(pady=10)
+    title_frame = tk.Frame(control_frame, bg="#1e1e1e")
+    title_frame.pack(pady=(15, 5))
+
+    title_label = tk.Label(
+        control_frame,
+        text="Fee Liquidator",
+        fg="#3dc9a3",
+        bg="#1e1e1e",
+        font=("Consolas", 22, "bold"),
+        pady=10
+    )
+    title_label.pack(pady=(15, 5))
+
+    # Optional: subtle flicker (you can remove this too if you want it static)
+    def flicker():
+        import random
+        if random.random() < 0.05:  # 5% chance
+            title_label.config(fg="#1e1e1e")
+            title_label.after(80, lambda: title_label.config(fg="#3dc9a3"))
+        title_label.after(4000, flicker)
+
+    flicker()
 
     wallet_label = tk.Label(control_frame, text="USD Wallet: $0.00", fg="cyan", bg="#1e1e1e", font=("Helvetica", 14))
     wallet_label.pack(pady=(0, 10))
+
+    spot_volume_label = tk.Label(
+        control_frame,
+        text=f"{CUTOFF_DAYS}-Day Spot Volume: $0.00",
+        fg="#FFD700",  # gold
+        bg="#1e1e1e",
+        font=("Helvetica", 14, "bold"),
+        relief="ridge",
+        bd=2,
+        padx=6,
+        pady=2
+    )
+    spot_volume_label.pack(pady=(0, 10))
 
     tk.Label(control_frame, text="Max Trade Amount ($):", fg="white", bg="#1e1e1e", font=("Helvetica", 13)).pack()
     amount_limit_entry = tk.Entry(control_frame, font=("Helvetica", 14), width=22, justify="center")
@@ -715,7 +865,6 @@ def start_gui():
     iter_label = tk.Label(control_frame, text="Iterations Completed: 0", fg="orange", bg="#1e1e1e", font=("Helvetica", 12))
     iter_label.pack()
 
-    # Status Indicator with improved visuals
     status_frame = tk.Frame(control_frame, bg="#1e1e1e")
     status_frame.pack(pady=5)
 
@@ -724,7 +873,7 @@ def start_gui():
         textvariable=status_var,
         fg="white",
         bg="#555",
-        font=("Helvetica", 11, "bold"),  # larger font
+        font=("Helvetica", 11, "bold"),
         padx=14,
         pady=8,
         relief="ridge",
@@ -735,14 +884,12 @@ def start_gui():
     update_status("🟡 Status: Idle", status_var, status_label)
     status_label.pack()
 
-    # Slippage Indicator
     slippage_label = tk.Label(control_frame, text="Expected Slippage: $0.00", fg="magenta", bg="#1e1e1e", font=("Helvetica", 12))
     slippage_label.pack(pady=(0, 10))
     real_slippage_label = tk.Label(control_frame, text="Real Slippage: $0.00", fg="cyan", bg="#1e1e1e", font=("Helvetica", 12))
     real_slippage_label.pack(pady=(0, 10))
 
-    # Fee Tier Selector
-    tk.Label(control_frame, text="Fee Tier:", fg="white", bg="#1e1e1e").pack()
+    tk.Label(control_frame, text="Estimate Fee Tier:", fg="white", bg="#1e1e1e", font=("Helvetica", 12)).pack(pady=(0, 2))
     fee_tier_var = tk.StringVar(value=selected_fee_tier_name)
     fee_tier_combo = ttk.Combobox(control_frame, textvariable=fee_tier_var, width=20, font=("Helvetica", 12))
     fee_tier_combo['values'] = list(coinbase_fee_tiers.keys())
@@ -750,12 +897,16 @@ def start_gui():
 
     def update_slippage(*args):
         try:
-            amt = float(amount_limit_entry.get())
-            iters = int(iteration_var.get())
+            amt_raw = amount_limit_entry.get().strip()
+            iters_raw = iteration_var.get().strip()
+            if not amt_raw or not iters_raw:
+                return
+            amt = float(amt_raw)
+            iters = int(iters_raw)
             tier_name = fee_tier_var.get()
             update_slippage_label(slippage_label, iters, amt, tier_name)
-        except Exception as e:
-            log(f"Failed to update slippage: {e}", "error")
+        except Exception:
+            pass
 
     def update_selected_fee_tier(*args):
         global selected_fee_tier_name
@@ -777,42 +928,144 @@ def start_gui():
     )
     order_type_label.pack(side="left")
 
+    def update_toggle_appearance():
+        if use_market_order:
+            toggle_btn.config(
+                text="⚡",
+                bg="#1e90ff",
+                fg="white",
+                activebackground="#4682b4",
+                activeforeground="white"
+            )
+        else:
+            toggle_btn.config(
+                text="📉",
+                bg="#2e8b57",
+                fg="white",
+                activebackground="#3cb371",
+                activeforeground="white"
+            )
+
     def toggle_order_type():
         global use_market_order
         use_market_order = not use_market_order
         order_type_label.config(text=f"Order Type: {'Market' if use_market_order else 'Limit'}")
-        toggle_btn.config(
-            text="🔄",
-            bg="#1e1e1e" if use_market_order else "#333"
-        )
+        update_toggle_appearance()
         update_slippage()
 
     toggle_btn = tk.Button(
         order_type_frame,
-        text="🔄",
+        text="",
         command=toggle_order_type,
         width=3,
-        bg="#333",
-        fg="white",
         relief="ridge",
         bd=1,
-        font=("Helvetica", 10)
+        font=("Helvetica", 12)
     )
     toggle_btn.pack(side="left", padx=(8, 0))
+    update_toggle_appearance()
 
-    # Start and stop buttons
-    start_btn = tk.Button(control_frame, text="Let's Go", command=lambda: threading.Thread(
-        target=run_feeliquidator,
-        args=(amount_limit_entry, iteration_var, wallet_label, volume_label, iter_label, status_var, status_label, start_btn, iteration_combo, real_slippage_label),
-        daemon=True
-    ).start(), bg="green", fg="white", font=("Helvetica", 12))
-    start_btn.pack(pady=5)
+    def confirm_run(amount, iterations, expected_slippage, proceed_callback):
+        popup = tk.Toplevel()
+        popup.title("Confirm Trade")
+        popup.configure(bg="#1e1e1e")
+        popup.geometry("420x200")
+        popup.resizable(False, False)
 
-    stop_btn = tk.Button(control_frame, text="Stop", command=stop_feeliquidator, bg="red", fg="white", font=("Helvetica", 12))
-    stop_btn.pack(pady=5)
+        msg_text = tk.Text(
+            popup,
+            height=6,
+            width=55,
+            bg="#1e1e1e",
+            fg="white",
+            font=("Helvetica", 12),
+            relief="flat",
+            wrap="none"
+        )
+        msg_text.insert("1.0", "This will likely cost ≈ ")
+        msg_text.insert("end", f"${expected_slippage:.4f}", "bold_red")
+        msg_text.insert("end", " in fees/slippage.\n\n")
 
+        msg_text.insert("end", "It will add ≈ ")
+        msg_text.insert("end", f"${amount * 2 * iterations:.2f}", "bold_green")
+        msg_text.insert("end", " in spot volume.\n\n")
 
-    # Logging Panel
+        msg_text.insert("end", "Continue?")
+        msg_text.tag_configure("bold_red", foreground="red", font=("Helvetica", 12, "bold"))
+        msg_text.tag_configure("bold_green", foreground="lime", font=("Helvetica", 12, "bold"))
+        msg_text.tag_configure("center", justify="center")
+        msg_text.tag_add("center", "1.0", "end")
+        msg_text.configure(state="disabled")
+        msg_text.pack(pady=10, padx=20)
+
+        def on_continue(event=None):
+            popup.destroy()
+            proceed_callback()
+
+        def on_cancel(event=None):
+            popup.destroy()
+            restore_controls(amount_limit_entry, iteration_combo, start_btn, status_var, status_label, volume_label, iter_label)
+            update_status("🟡 Status: Idle", status_var, status_label)
+
+        btn_frame = tk.Frame(popup, bg="#1e1e1e")
+        btn_frame.pack(pady=10)
+
+        continue_btn = tk.Button(btn_frame, text="Continue", command=on_continue, bg="green", fg="white", font=("Helvetica", 12), width=10)
+        continue_btn.grid(row=0, column=0, padx=10)
+
+        cancel_btn = tk.Button(btn_frame, text="Cancel", command=on_cancel, bg="red", fg="white", font=("Helvetica", 12), width=10)
+        cancel_btn.grid(row=0, column=1, padx=10)
+
+        # Key bindings for Enter/Escape
+        popup.bind("<Return>", on_continue)
+        popup.bind("<Escape>", on_cancel)
+
+        # Center the popup over the main window
+        root_x = root.winfo_rootx()
+        root_y = root.winfo_rooty()
+        root_width = root.winfo_width()
+        root_height = root.winfo_height()
+        popup.update_idletasks()
+        popup_width = popup.winfo_width()
+        popup_height = popup.winfo_height()
+        x = root_x + (root_width // 2) - (popup_width // 2)
+        y = root_y + (root_height // 2) - (popup_height // 2)
+        popup.geometry(f"+{x}+{y}")
+
+        popup.transient()
+        popup.grab_set()
+        popup.focus_set()
+        popup.wait_window()
+
+    def start_with_confirmation():
+        try:
+            amt = float(amount_limit_entry.get())
+            iters = int(iteration_combo.get())
+            tier = coinbase_fee_tiers.get(fee_tier_var.get(), default_fee)
+            fee_pct = tier["taker"] if use_market_order else tier["maker"]
+            est_slip = amt * fee_pct * 4 * iters / 2.25
+
+            def proceed():
+                threading.Thread(
+                    target=run_feeliquidator,
+                    args=(amount_limit_entry, iteration_combo, wallet_label, volume_label, iter_label, status_var, status_label, start_btn, iteration_combo, real_slippage_label, spot_volume_label),
+                    daemon=True
+                ).start()
+
+            confirm_run(amt, iters, est_slip, proceed)
+
+        except Exception as e:
+            log(f"Invalid input: {e}", "error")
+
+    button_row = tk.Frame(control_frame, bg="#1e1e1e")
+    button_row.pack(pady=5)
+
+    start_btn = tk.Button(button_row, text="Let's Go", command=start_with_confirmation, bg="green", fg="white", font=("Helvetica", 12), width=10)
+    start_btn.pack(side=tk.LEFT, padx=(0, 10))
+
+    stop_btn = tk.Button(button_row, text="Stop", command=stop_feeliquidator, bg="red", fg="white", font=("Helvetica", 12), width=10)
+    stop_btn.pack(side=tk.LEFT)
+
     log_frame = tk.Frame(main_frame, bg="#1e1e1e", width=400)
     log_frame.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
     log_frame.pack_propagate(False)
@@ -832,7 +1085,6 @@ def start_gui():
     log_text.tag_config("default", foreground="white")
     log_text.tag_config("debug", foreground="gray")
 
-    # Now that all variables are defined, attach event listeners
     amount_limit_entry.bind("<KeyRelease>", lambda e: update_slippage())
     iteration_var.trace_add("write", update_slippage)
     fee_tier_var.trace_add("write", update_slippage)
@@ -840,6 +1092,18 @@ def start_gui():
     update_wallet_label(wallet_label)
     poll_log_queue(log_text)
     bind_enter_key_to_buttons(root)
+
+    # Fetch and update 30-day spot volume on startup
+    def update_spot_volume_on_start():
+        try:
+            volume = get_spot_volume()
+            if volume is not None:
+                spot_volume_label.config(text=f"{CUTOFF_DAYS}-Day Spot Volume: ${volume:,.2f}")
+                #log(f"📊 {CUTOFF_DAYS}-Day Spot Volume (all pairs): ${volume:,.2f}")
+        except Exception as e:
+            log(f"[WARN] Could not fetch spot volume: {e}")
+
+    threading.Thread(target=update_spot_volume_on_start, daemon=True).start()
 
     root.mainloop()
 

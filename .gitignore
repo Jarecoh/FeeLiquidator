@@ -1,2 +1,3 @@
 vars/trade_api_key.json
 logs/trade.log
+__pycache__
