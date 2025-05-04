@@ -579,7 +579,7 @@ def run_feeliquidator(amount_limit_entry, iteration_var, wallet_label, volume_la
             continue
 
         log(f"Waiting for BUY order to fill (ID: {active_buy_id})", "status")
-        if not wait_for_order_fill(active_buy_id, timeout=150, should_stop_event=stop_event):
+        if not wait_for_order_fill(active_buy_id, timeout=90, should_stop_event=stop_event):
             log("BUY not filled. Cancelling...", "warn")
             if active_buy_id:
                 try:
@@ -596,7 +596,7 @@ def run_feeliquidator(amount_limit_entry, iteration_var, wallet_label, volume_la
             log("❌ Could not determine filled size. Skipping iteration.", "error")
             continue
 
-        retry_limit = 3
+        retry_limit = 50
         sell_id = None
         for attempt in range(retry_limit):
             if stop_event.is_set():
@@ -616,12 +616,25 @@ def run_feeliquidator(amount_limit_entry, iteration_var, wallet_label, volume_la
                 ).to_dict()
             else:
                 log(f"SELL {actual_base_size} {product_id} (post-only)", "status")
-                sell_order = place_limit_order(
-                    product_id=product_id,
-                    side="SELL",
-                    base_size=actual_base_size,
-                    post_only=True
-                )
+                # 🆕 Re-fetch BTC balance to avoid preview rejection
+            try:
+                btc_account = next((a for a in client.get_accounts().accounts if a.currency == "BTC"), None)
+                if not btc_account:
+                    raise ValueError("BTC account not found")
+                available_btc = float(btc_account.available_balance['value'])
+                if available_btc < actual_base_size:
+                    log(f"❌ Failed to repost SELL limit order: Insufficient balance ({available_btc:.8f} BTC available, needed {actual_base_size})", "error")
+                    continue
+            except Exception as e:
+                log(f"❌ Failed to fetch BTC balance before SELL retry: {e}", "error")
+                continue
+
+            sell_order = place_limit_order(
+                product_id=product_id,
+                side="SELL",
+                base_size=available_btc,
+                post_only=True
+            )
 
             if "success_response" in sell_order:
                 sell_id = sell_order["success_response"]["order_id"]
